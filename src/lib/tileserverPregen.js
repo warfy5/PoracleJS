@@ -5,6 +5,77 @@ class TileserverPregen {
 		this.axios = axios
 		this.log = log
 		this.config = config
+
+		// Normalize staticProviderURL to array format for failover support
+		this.tileservers = this.normalizeTileserverConfig(config.geocoding.staticProviderURL)
+		this.currentServerIndex = 0
+	}
+
+	normalizeTileserverConfig(urlConfig) {
+		const defaultTimeout = this.config.tuning?.tileserverTimeout || 10000
+
+		// Handle single string (backward compatibility)
+		if (typeof urlConfig === 'string') {
+			return [{ url: urlConfig, timeout: defaultTimeout }]
+		}
+
+		// Handle array
+		if (Array.isArray(urlConfig)) {
+			return urlConfig.map(item => {
+				// Array of strings
+				if (typeof item === 'string') {
+					return { url: item, timeout: defaultTimeout }
+				}
+				// Array of objects (future enhancement)
+				return {
+					url: item.url,
+					timeout: item.timeout || defaultTimeout
+				}
+			})
+		}
+
+		// Fallback for invalid config
+		this.log.warn('Invalid staticProviderURL configuration, using empty fallback')
+		return [{ url: '', timeout: defaultTimeout }]
+	}
+
+	async withFailover(logReference, operation, operationName) {
+		const serverCount = this.tileservers.length
+		let lastError = null
+
+		// Try each server starting from current
+		for (let attempt = 0; attempt < serverCount; attempt++) {
+			const serverIndex = (this.currentServerIndex + attempt) % serverCount
+			const server = this.tileservers[serverIndex]
+
+			try {
+				this.log.debug(`${logReference}: Trying tileserver ${server.url} for ${operationName} (attempt ${attempt + 1}/${serverCount})`)
+
+				// Execute operation with current server
+				const result = await operation(server)
+
+				// Success! Update current server for next request (sticky behavior)
+				if (serverIndex !== this.currentServerIndex) {
+					this.log.info(`${logReference}: ${operationName} succeeded on failover server #${attempt + 1}: ${server.url}`)
+					this.currentServerIndex = serverIndex
+				}
+
+				return result
+
+			} catch (error) {
+				lastError = error
+				this.log.warn(`${logReference}: ${operationName} failed on ${server.url}: ${error.message || error}`)
+
+				// If not last server, log failover attempt
+				if (attempt < serverCount - 1) {
+					this.log.info(`${logReference}: Failing over to next tileserver...`)
+				}
+			}
+		}
+
+		// All servers failed
+		this.log.error(`${logReference}: ${operationName} failed on all ${serverCount} tileserver(s)`)
+		return null
 	}
 
 	getConfigForTileType(maptype) {
@@ -42,46 +113,63 @@ class TileserverPregen {
 			mapType = 'multistaticmap'
 			templateType = 'multi-'
 		}
-		const url = `${this.config.geocoding.staticProviderURL}/${mapType}/poracle-${templateType}${type}?pregenerate=true&regeneratable=true`
-		try {
+
+		return this.withFailover(logReference, async (server) => {
+			const url = `${server.url}/${mapType}/poracle-${templateType}${type}?pregenerate=true&regeneratable=true`
+
 			this.log.debug(`${logReference}: Pre-generating static map ${url}`)
 			const hrstart = process.hrtime()
 
-			const timeoutMs = this.config.tuning.tileserverTimeout || 10000
-			const source = axios.CancelToken.source()
+			// Setup timeout with cancel token
+			const timeoutMs = server.timeout
+			const source = this.axios.CancelToken.source()
 			const timeout = setTimeout(() => {
 				source.cancel(`Timeout waiting for response - ${timeoutMs}ms`)
-				// Timeout Logic
 			}, timeoutMs)
 
-			const result = await axios.post(url, data, { cancelToken: source.token })
-			clearTimeout(timeout)
-			if (result.status !== 200) {
-				this.log.warn(`${logReference}: Failed to Pregenerate ${templateType}StaticMap. Got ${result.status}. Error: ${result.data ? result.data.reason : '?'}.`)
-				return null
-			} if (typeof result.data !== 'string') {
-				this.log.warn(`${logReference}: Failed to Pregenerate ${templateType}StaticMap. No id returned.`)
-				return null
-			}
-			const hrend = process.hrtime(hrstart)
-			const hrendms = hrend[1] / 1000000
+			try {
+				// Make POST request to tileserver
+				const result = await this.axios.post(url, data, { cancelToken: source.token })
+				clearTimeout(timeout)
 
-			if (result.data.includes('<')) { // check for HTML error response
-				this.log.warn(`${logReference}: Failed to Pregenerate ${templateType}StaticMap. Got invalid response from tileserver - ${result.data}`)
-				return null
-			}
-			const tileResult = result.data.startsWith('http') ? result.data : new URL(`${mapType}/pregenerated/${result.data}`, this.config.geocoding.staticProviderURL).toString();
-			(this.config.logger.timingStats ? this.log.verbose : this.log.debug)(`${logReference}: Tile generated ${tileResult} (${hrendms} ms)`)
+				// Validate response
+				if (result.status !== 200) {
+					throw new Error(`HTTP ${result.status}: ${result.data?.reason || 'Unknown error'}`)
+				}
 
-			return tileResult
-		} catch (error) {
-			if (error.response) {
-				this.log.warn(`${logReference}: Failed to Pregenerate ${templateType}StaticMap. Got ${error.response.status}. Error: ${error.response.data ? error.response.data.reason : '?'}.`)
-			} else {
-				this.log.warn(`${logReference}: Failed to Pregenerate ${templateType}StaticMap. Error: ${error}.`)
+				if (typeof result.data !== 'string') {
+					throw new Error('Tileserver did not return tile ID string')
+				}
+
+				if (result.data.includes('<')) {
+					throw new Error(`Tileserver returned HTML error page`)
+				}
+
+				// Calculate timing
+				const hrend = process.hrtime(hrstart)
+				const hrendms = hrend[1] / 1000000
+
+				// Build full tile URL
+				const tileResult = result.data.startsWith('http')
+					? result.data
+					: new URL(`${mapType}/pregenerated/${result.data}`, server.url).toString()
+
+				// Log with timing stats
+				const logFn = this.config.logger?.timingStats ? this.log.verbose : this.log.debug
+				logFn(`${logReference}: Tile generated ${tileResult} (${hrendms.toFixed(0)} ms)`)
+
+				return tileResult
+
+			} catch (error) {
+				clearTimeout(timeout)
+
+				// Re-throw for failover handler
+				if (error.response) {
+					throw new Error(`HTTP ${error.response.status}: ${error.response.data?.reason || error.response.statusText}`)
+				}
+				throw error
 			}
-			return null
-		}
+		}, `getPregeneratedTileURL(${type})`)
 	}
 
 	async getTileURL(logReference, type, data, staticMapType) {
@@ -91,11 +179,17 @@ class TileserverPregen {
 			mapType = 'multistaticmap'
 			templateType = 'multi-'
 		}
-		const url = new URL(`${mapType}/poracle-${templateType}${type}`, this.config.geocoding.staticProviderURL)
+
+		// getTileURL just generates URLs, doesn't make HTTP requests
+		// Use current server (or first if current is invalid)
+		const server = this.tileservers[this.currentServerIndex] || this.tileservers[0]
+
+		const url = new URL(`${mapType}/poracle-${templateType}${type}`, server.url)
 		Object.keys(data).forEach((item) => {
 			url.searchParams.set(item, data[item])
 		})
 
+		this.log.debug(`${logReference}: Generated tile URL ${url}`)
 		return url.toString()
 	}
 
